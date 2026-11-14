@@ -2987,6 +2987,139 @@ class TestArrowDehumanize:
                 assert arw.dehumanize(past_string, locale=lang) == past
                 assert arw.dehumanize(future_string, locale=lang) == future
 
+    # ------------------------------------------------------------------
+    # Fractional durations. Historically the number regex only matched \d+,
+    # so "1.5 hours" was split on the decimal point and silently parsed as 5.
+    # These tests lock the unified behavior: the full decimal value is honored
+    # for every fixed-length unit, symmetrically in both directions, across every
+    # supported locale entry point, while integer and invalid inputs are unchanged.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "unit,quantity,shift_kwargs",
+        [
+            ("seconds", 1.5, dict(seconds=-1.5)),
+            ("minutes", 1.5, dict(minutes=-1.5)),
+            ("hours", 1.5, dict(hours=-1.5)),
+            ("hours", 0.5, dict(hours=-0.5)),
+            ("hours", 10.75, dict(hours=-10.75)),
+            ("days", 1.5, dict(days=-1.5)),
+            ("weeks", 2.25, dict(weeks=-2.25)),
+        ],
+    )
+    def test_fractional_fixed_units_ago(self, unit, quantity, shift_kwargs):
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+        expected = arw.shift(**shift_kwargs)
+
+        result = arw.dehumanize(f"{quantity} {unit} ago")
+
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        "unit,quantity,shift_kwargs",
+        [
+            ("seconds", 1.5, dict(seconds=1.5)),
+            ("minutes", 1.5, dict(minutes=1.5)),
+            ("hours", 1.5, dict(hours=1.5)),
+            ("hours", 0.5, dict(hours=0.5)),
+            ("hours", 10.75, dict(hours=10.75)),
+            ("days", 1.5, dict(days=1.5)),
+            ("weeks", 2.25, dict(weeks=2.25)),
+        ],
+    )
+    def test_fractional_fixed_units_future(self, unit, quantity, shift_kwargs):
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+        expected = arw.shift(**shift_kwargs)
+
+        result = arw.dehumanize(f"in {quantity} {unit}")
+
+        assert result == expected
+
+    def test_fractional_directions_are_symmetric(self):
+        # ago and in with the same magnitude must land at equal distance on
+        # either side of the reference instant.
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+
+        earlier = arw.dehumanize("1.5 hours ago")
+        later = arw.dehumanize("in 1.5 hours")
+
+        assert arw - earlier == later - arw == timedelta(hours=1.5)
+
+    def test_fractional_not_silently_amputated(self):
+        # The original bug: "1.5" was reduced to its fractional digits ("5").
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+
+        assert arw.dehumanize("1.5 hours ago") == arrow.Arrow(2025, 1, 1, 10, 30, 0)
+        assert arw.dehumanize("1.5 minutes ago") == arrow.Arrow(2025, 1, 1, 11, 58, 30)
+        # Fractional days/weeks must keep the fractional part instead of being
+        # truncated to whole days by the underlying relativedelta.
+        assert arw.dehumanize("1.5 days ago") == arrow.Arrow(2024, 12, 31, 0, 0, 0)
+        assert arw.dehumanize("2.25 weeks ago") == arrow.Arrow(2024, 12, 16, 18, 0, 0)
+
+    def test_fractional_mixed_granularity(self):
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+        expected = arw.shift(hours=-1.5, minutes=-30)
+
+        assert arw.dehumanize("1.5 hours and 30 minutes ago") == expected
+
+    def test_decimal_without_fractional_part_treated_as_integer(self):
+        # "3.0" parses to a float but has no fractional component, so it must
+        # follow the exact integer code path (no spurious zero timedelta path).
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+
+        assert arw.dehumanize("3.0 hours ago") == arw.dehumanize("3 hours ago")
+
+    @pytest.mark.parametrize("unit", ["months", "years", "quarters"])
+    def test_fractional_calendar_units_rejected(self, unit):
+        # A fraction of a calendar unit is ambiguous (month/year lengths vary),
+        # so it must raise rather than be silently truncated or mis-added.
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+
+        with pytest.raises(ValueError):
+            arw.dehumanize(f"1.5 {unit} ago")
+
+    def test_fractional_across_locales(self, locale_list_no_weeks: List[str]):
+        # Every supported dehumanize locale shares the same numeric entry point,
+        # so the full decimal value must be honored in each scheduling domain.
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+        expected_past = arw.shift(hours=-1.5)
+        expected_future = arw.shift(hours=1.5)
+
+        for lang in locale_list_no_weeks:
+            locale_obj = locales.get_locale(lang)
+            template = locale_obj.timeframes["hours"]
+            if isinstance(template, dict):
+                # Pick any plural template that contains the number placeholder.
+                template = next(v for v in template.values() if "{0}" in v)
+            timeframe = template.format("1.5")
+            past_string = locale_obj.past.format(timeframe)
+            future_string = locale_obj.future.format(timeframe)
+
+            assert arw.dehumanize(past_string, locale=lang) == expected_past
+            assert arw.dehumanize(future_string, locale=lang) == expected_future
+
+    def test_integer_durations_unchanged(self):
+        # Regression guard: integer parsing must remain byte-for-byte identical.
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+
+        assert arw.dehumanize("2 hours ago") == arrow.Arrow(2025, 1, 1, 10, 0, 0)
+        assert arw.dehumanize("in 5 seconds") == arrow.Arrow(2025, 1, 1, 12, 0, 5)
+        assert arw.dehumanize("an hour ago") == arrow.Arrow(2025, 1, 1, 11, 0, 0)
+        assert arw.dehumanize("3 days ago") == arrow.Arrow(2024, 12, 29, 12, 0, 0)
+        assert arw.dehumanize("2 months ago") == arrow.Arrow(2024, 11, 1, 12, 0, 0)
+        assert arw.dehumanize("2 years ago") == arrow.Arrow(2023, 1, 1, 12, 0, 0)
+
+    @pytest.mark.parametrize(
+        "bad_input",
+        ["abc hours ago", "hours ago", "in", ""],
+    )
+    def test_invalid_numeric_forms_still_error(self, bad_input):
+        # Pre-existing invalid forms must keep raising instead of being parsed.
+        arw = arrow.Arrow(2025, 1, 1, 12, 0, 0)
+
+        with pytest.raises(ValueError):
+            arw.dehumanize(bad_input)
+
 
 class TestArrowIsBetween:
     def test_start_before_end(self):

@@ -283,6 +283,22 @@ Support for a growing number of locales (see ``constants.py`` for supported lang
     >>> later
     <Arrow [2021-05-18T22:27:34.787885+00:00]>
 
+Fractional quantities are honored in full for the fixed-length units weeks, days,
+hours, minutes and seconds, in both directions:
+
+.. code-block:: python
+
+    >>> arw = arrow.utcnow()
+    >>> arw
+    <Arrow [2021-04-20T22:27:34.787885+00:00]>
+    >>> arw.dehumanize("1.5 hours ago")
+    <Arrow [2021-04-20T20:57:34.787885+00:00]>
+    >>> arw.dehumanize("in 1.5 hours")
+    <Arrow [2021-04-20T23:57:34.787885+00:00]>
+
+Fractional months, quarters and years are not supported because their length varies
+with the calendar, and raise a ``ValueError``.
+
 Ranges & Spans
 ~~~~~~~~~~~~~~
 

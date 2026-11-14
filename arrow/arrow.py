@@ -17,6 +17,7 @@ from time import struct_time
 from typing import (
     Any,
     ClassVar,
+    Dict,
     Final,
     Generator,
     Iterable,
@@ -73,6 +74,30 @@ _GRANULARITY = Literal[
     "quarter",
     "year",
 ]
+
+# Placeholder substituted into locale timeframe strings when dehumanizing.
+# Matches a whole numeric quantity, either an integer ("2") or a decimal ("1.5"),
+# so fractional durations are captured as one value instead of being split on ".".
+_DEHUMANIZE_NUMBER_PLACEHOLDER = r"\d+(?:\.\d+)?"
+
+# Extracts a quantity back out of a matched timeframe fragment. Group 1 holds the
+# integer part and group 2 the optional fractional part (digits following ".").
+_DEHUMANIZE_NUM_PATTERN = re.compile(r"(\d+)(?:\.(\d+))?")
+
+# Fixed-length units that can be expressed exactly as a span of time, independent
+# of the calendar. The keys also enumerate every unit whose fractional part is
+# honored in full; values are the unit's size in whole seconds.
+_DEHUMANIZE_SECONDS_PER_UNIT = {
+    "weeks": 7 * 24 * 60 * 60,
+    "days": 24 * 60 * 60,
+    "hours": 60 * 60,
+    "minutes": 60,
+    "seconds": 1,
+}
+
+# Calendar units whose length depends on the referenced date, so a fractional
+# quantity has no unambiguous meaning and is rejected rather than truncated.
+_DEHUMANIZE_CALENDAR_UNITS = ("months", "years", "quarters")
 
 
 class Arrow:
@@ -1365,6 +1390,12 @@ class Arrow:
                 >>> later
                 <Arrow [2021-05-18T22:27:34.787885+00:00]>
 
+        Fractional quantities are honored in full for the fixed-length units
+        weeks, days, hours, minutes and seconds (e.g. ``"1.5 hours ago"`` shifts
+        by exactly 90 minutes), identically in both the past and future
+        directions. Fractional months, quarters and years are ambiguous because
+        their length depends on the calendar and raise a :class:`ValueError`.
+
         """
 
         # Create a locale object based off given local
@@ -1391,9 +1422,6 @@ class Arrow:
             False,
         )
 
-        # Create a regex pattern object for numbers
-        num_pattern = re.compile(r"\d+")
-
         # Search input string for each time unit within locale
         for unit, unit_object in locale_obj.timeframes.items():
             # Need to check the type of unit_object to create the correct dictionary
@@ -1406,9 +1434,9 @@ class Arrow:
             # Needs to cycle all through strings as some locales have strings that
             # could overlap in a regex match, since input validation isn't being performed.
             for time_delta, time_string in strings_to_search.items():
-                # Replace {0} with regex \d representing digits
+                # Replace {0} with a number pattern that also captures decimals
                 search_string = str(time_string)
-                search_string = search_string.format(r"\d+")
+                search_string = search_string.format(_DEHUMANIZE_NUMBER_PLACEHOLDER)
 
                 # Create search pattern and find within string
                 pattern = re.compile(rf"(^|\b|\d){search_string}")
@@ -1419,7 +1447,7 @@ class Arrow:
                     continue
 
                 match_string = match.group()
-                num_match = num_pattern.search(match_string)
+                num_match = _DEHUMANIZE_NUM_PATTERN.search(match_string)
 
                 # If no number matches
                 # Need for absolute value as some locales have signs included in their objects
@@ -1427,8 +1455,13 @@ class Arrow:
                     change_value = (
                         1 if not time_delta.isnumeric() else abs(int(time_delta))
                     )
+                elif num_match.group(2) is None:
+                    # Integer quantities keep their exact historical int type and value.
+                    change_value = int(num_match.group(1))
                 else:
-                    change_value = int(num_match.group())
+                    # Parse the whole decimal (integer and fractional parts together) so
+                    # "1.5" is honored as 1.5 rather than silently reduced to 5.
+                    change_value = float(num_match.group())
 
                 # No time to update if now is the unit
                 if unit == "now":
@@ -1478,7 +1511,67 @@ class Arrow:
 
         time_changes = {k: sign_val * v for k, v in time_object_info.items()}
 
-        return current_time.shift(check_imaginary=True, **time_changes)
+        integer_changes, fractional_delta = self._dehumanize_fractional_components(
+            time_changes
+        )
+
+        shifted = current_time.shift(check_imaginary=True, **integer_changes)
+
+        # Fixed-length fractional units are applied as an exact timedelta so that
+        # the full fractional value takes effect (relativedelta truncates fractional
+        # days/weeks and rejects fractional months/years). A zero delta is skipped to
+        # preserve identical results, including imaginary-time handling, for integers.
+        if fractional_delta:
+            shifted = shifted.fromdatetime(shifted._datetime + fractional_delta)
+
+        return shifted
+
+    @staticmethod
+    def _dehumanize_fractional_components(
+        time_changes: Mapping[str, Union[int, float]],
+    ) -> Tuple[Dict[str, int], timedelta]:
+        """Splits parsed dehumanize components into integer calendar shifts and an
+        exact fractional :class:`timedelta`.
+
+        Integer quantities are forwarded unchanged so the historical behavior is
+        preserved bit for bit. Fractional values of fixed-length units (weeks, days,
+        hours, minutes, seconds) are honored in full by converting their fractional
+        parts into a single exact :class:`timedelta`; fractional calendar units
+        (months, quarters, years) are rejected because their length depends on the
+        referenced date and a fraction of them has no unambiguous meaning.
+
+        :param time_changes: mapping of plural unit names to signed quantities.
+        :returns: a tuple of integer shift kwargs and a fractional timedelta.
+        """
+
+        integer_changes: Dict[str, int] = {}
+        fractional_seconds = 0.0
+
+        for unit, value in time_changes.items():
+            if not isinstance(value, float) or value.is_integer():
+                # Integers (and float values without a fractional part, e.g. 3.0
+                # parsed from "3.0") keep the original integer-based code path.
+                integer_changes[unit] = int(value)
+                continue
+
+            if unit in _DEHUMANIZE_CALENDAR_UNITS:
+                raise ValueError(
+                    f"Fractional values are not supported for the {unit!r} unit "
+                    "because its length varies with the calendar. Use whole "
+                    f"{unit}, or express the fractional part in a smaller fixed "
+                    "unit (weeks, days, hours, minutes or seconds)."
+                )
+
+            # Fixed-length units: carry the whole part through the integer shift and
+            # fold the fractional part into an exact timedelta. Rounding to
+            # microseconds matches datetime resolution and absorbs binary float noise.
+            whole = int(trunc(value))
+            integer_changes[unit] = whole
+            fractional_seconds += (value - whole) * _DEHUMANIZE_SECONDS_PER_UNIT[unit]
+
+        fractional_delta = timedelta(microseconds=round(fractional_seconds * 1_000_000))
+
+        return integer_changes, fractional_delta
 
     # query functions
 
